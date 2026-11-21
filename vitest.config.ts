@@ -7,6 +7,13 @@ export default defineConfig({
     resolve: {
         alias: pterodactylTestAliases(),
     },
+    server: {
+        fs: {
+            // The SDK's setup file is in the panel (../../packages/sdk), outside this directory, and
+            // Vite only serves files from the root it was started in unless they are allowed here.
+            allow: [fileURLToPath(new URL('../../', import.meta.url))],
+        },
+    },
     test: {
         name: 'sso',
         environment: 'jsdom',

@@ -63,7 +63,8 @@ it('adds sign-in buttons to the login form and a connections page to the account
         slots: { register: vi.fn() },
         screens: { register: vi.fn() },
         columns: { register: vi.fn() },
-        components: { replace: vi.fn() },
+        views: { override: vi.fn() },
+        forms: { extend: vi.fn() },
     };
 
     extension.setup(context);

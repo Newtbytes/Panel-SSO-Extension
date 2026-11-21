@@ -381,6 +381,105 @@ test('a steam assertion that is tampered with is refused before asking steam', f
     'mismatched identity' => [['openid.identity' => 'https://steamcommunity.com/openid/id/76561197960435531']],
 ]);
 
+test('the openid connect provider is offered once it has an issuer, under its button label', function (): void {
+    configure(['discord_enabled' => false]);
+    configureOpenId(['oidc_issuer' => '']);
+    $this->getJson('/extensions/sso/providers')->assertOk()->assertExactJson(['data' => []]);
+
+    configureOpenId();
+    $this->getJson('/extensions/sso/providers')->assertOk()->assertExactJson(['data' => [
+        ['id' => 'oidc', 'name' => 'OpenID Connect', 'login_url' => '/extensions/sso/oidc/redirect'],
+    ]]);
+
+    configureOpenId(['oidc_label' => 'authentik']);
+    $this->getJson('/extensions/sso/providers')->assertOk()->assertJsonPath('data.0.name', 'authentik');
+});
+
+test('starting an openid connect login sends the browser to the discovered authorization endpoint', function (): void {
+    configureOpenId();
+    fakeOpenId();
+
+    $location = $this->get('/extensions/sso/oidc/redirect')->assertRedirect()->headers->get('Location');
+
+    expect($location)->toStartWith('https://id.example.test/application/o/authorize/?');
+    parse_str((string) parse_url($location, PHP_URL_QUERY), $query);
+    expect($query)->toMatchArray([
+        'response_type' => 'code',
+        'client_id' => 'oidc-client',
+        'redirect_uri' => url('/extensions/sso/oidc/callback'),
+        'scope' => 'openid email profile',
+        'code_challenge_method' => 'S256',
+    ]);
+    expect($query['state'])->toBe(session('sso.flow.state'));
+    Http::assertSent(fn (HttpRequest $request): bool => $request->url() === 'https://id.example.test/application/o/panel/.well-known/openid-configuration');
+});
+
+test('a linked openid connect account signs in through the discovered endpoints, matched by issuer and subject', function (): void {
+    $user = user();
+    configureOpenId();
+    fakeOpenId(['name' => null, 'picture' => 'javascript:alert(1)']);
+
+    $this->actingAs($user);
+    openIdCallback($this, 'link')->assertRedirect('/account/connections?sso_linked=oidc');
+    expect(Identity::query()->sole()->only(['user_id', 'name', 'email', 'avatar_url']))->toBe([
+        'user_id' => $user->id,
+        'name' => 'robin',
+        'email' => 'robin@id.example.test',
+        'avatar_url' => null,
+    ]);
+
+    auth()->logout();
+    fakeOpenId();
+    openIdCallback($this)->assertRedirect('/');
+    $this->assertAuthenticatedAs($user);
+    expect(Identity::query()->sole()->only(['name', 'avatar_url']))->toBe(['name' => 'Robin Oak', 'avatar_url' => 'https://id.example.test/avatars/robin.png']);
+    Http::assertSent(fn (HttpRequest $request): bool => $request->url() === 'https://id.example.test/application/o/token/'
+        && $request['grant_type'] === 'authorization_code'
+        && $request['code'] === 'abc'
+        && $request['client_id'] === 'oidc-client'
+        && $request['client_secret'] === 'oidc-secret'
+        && $request['redirect_uri'] === url('/extensions/sso/oidc/callback')
+        && Pkce::isValidVerifier($request['code_verifier']));
+    Http::assertSent(fn (HttpRequest $request): bool => $request->url() === 'https://id.example.test/application/o/userinfo/' && $request->hasHeader('Authorization', 'Bearer oidc-token'));
+
+    // The same subject from another issuer is someone else.
+    auth()->logout();
+    configureOpenId(['oidc_issuer' => 'https://other.example.test/application/o/panel/']);
+    fakeOpenId([], 'other.example.test');
+    openIdCallback($this)->assertRedirect('/auth/login?sso_error=unlinked');
+    $this->assertGuest();
+});
+
+test('an unlinked openid connect account is linked by email only when the provider verified it', function (mixed $verified, bool $links): void {
+    $user = user(['email' => 'robin@id.example.test']);
+    configureOpenId(['link_by_email' => true]);
+    fakeOpenId(['email_verified' => $verified]);
+
+    openIdCallback($this)->assertRedirect($links ? '/' : '/auth/login?sso_error=unlinked');
+
+    $links ? $this->assertAuthenticatedAs($user) : $this->assertGuest();
+    expect(Identity::query()->count())->toBe($links ? 1 : 0);
+})->with([
+    'verified' => [true, true],
+    'verified as a string' => ['true', true],
+    'unverified (authentik\'s default)' => [false, false],
+    'unverified as a string' => ['false', false],
+    'no claim' => [null, false],
+]);
+
+test('an openid connect discovery document that does not fit the issuer is refused before the browser leaves', function (array $discovery): void {
+    configureOpenId();
+    fakeOpenId([], 'id.example.test', $discovery);
+
+    $this->get('/extensions/sso/oidc/redirect')->assertRedirect('/auth/login?sso_error=provider');
+
+    expect(session()->has('sso.flow'))->toBeFalse();
+})->with([
+    'another issuer' => [['issuer' => 'https://evil.example.test/application/o/panel/']],
+    'no userinfo endpoint' => [['userinfo_endpoint' => null]],
+    'non http endpoint' => [['authorization_endpoint' => 'javascript:alert(1)']],
+]);
+
 /**
  * @param array
  */
@@ -477,6 +576,63 @@ function steamCallback(IntegrationTestCase $test, array $overrides = [], string 
     ]);
 
     return $test->get('/extensions/sso/steam/callback?'.http_build_query(['state' => $state, ...$assertion], '', '&', PHP_QUERY_RFC3986));
+}
+
+/**
+ * @param array
+ */
+function configureOpenId(array $values = []): void
+{
+    configure([
+        'oidc_enabled' => true,
+        'oidc_issuer' => 'https://id.example.test/application/o/panel/',
+        'oidc_client_id' => 'oidc-client',
+        'oidc_client_secret' => 'oidc-secret',
+        ...$values,
+    ]);
+}
+
+/**
+ * Fakes an authentik-style provider: its issuer ends in a slash, and the endpoints sit beside it.
+ *
+ * @param array
+ * @param string
+ * @param array
+ */
+function fakeOpenId(array $user = [], string $host = 'id.example.test', array $discovery = []): void
+{
+    Http::swap(new Factory);
+    Http::fake([
+        "{$host}/application/o/panel/.well-known/openid-configuration" => Http::response([
+            'issuer' => "https://{$host}/application/o/panel/",
+            'authorization_endpoint' => "https://{$host}/application/o/authorize/",
+            'token_endpoint' => "https://{$host}/application/o/token/",
+            'userinfo_endpoint' => "https://{$host}/application/o/userinfo/",
+            ...$discovery,
+        ]),
+        "{$host}/application/o/token/" => Http::response(['access_token' => 'oidc-token', 'token_type' => 'Bearer']),
+        "{$host}/application/o/userinfo/" => Http::response([
+            'sub' => 'a1b2c3d4',
+            'name' => 'Robin Oak',
+            'preferred_username' => 'robin',
+            'email' => 'robin@id.example.test',
+            'email_verified' => true,
+            'picture' => "https://{$host}/avatars/robin.png",
+            ...$user,
+        ]),
+    ]);
+}
+
+/**
+ * @param IntegrationTestCase
+ * @param string
+ * @return TestResponse
+ */
+function openIdCallback(IntegrationTestCase $test, string $intent = 'login'): TestResponse
+{
+    $test->get($intent === 'link' ? '/extensions/sso/oidc/link' : '/extensions/sso/oidc/redirect')->assertRedirect();
+
+    return $test->get('/extensions/sso/oidc/callback?code=abc&state='.session('sso.flow.state'));
 }
 
 final class BrokenProvider implements IdentityProvider
